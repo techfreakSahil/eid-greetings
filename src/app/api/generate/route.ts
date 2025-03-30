@@ -11,7 +11,7 @@ const redis = new Redis({
 });
 
 const RATE_LIMIT = {
-  TOKENS_PER_WINDOW: 10,
+  TOKENS_PER_WINDOW: 5,
   WINDOW_SIZE_IN_SECONDS: 60 * 60,
 };
 
