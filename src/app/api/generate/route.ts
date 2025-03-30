@@ -49,9 +49,9 @@ const EID_HADITHS = [
 
 export async function POST(request: Request) {
   try {
-    const headersList = headers();
-    const ip = (await headersList).get('x-forwarded-for') || 'unknown';
-    const userAgent = (await headersList).get('user-agent') || 'unknown';
+    const headersList = await headers();
+    const ip = headersList.get('x-forwarded-for') || 'unknown';
+    const userAgent = headersList.get('user-agent') || 'unknown';
 
     // Create a unique identifier for the client
     const clientId = `${ip}:${userAgent}`.substring(0, 64);
@@ -64,6 +64,15 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { error: 'Rate limit exceeded. Please try again later.' },
         { status: 429 }
+      );
+    }
+
+    // Check if client is blocked before processing the request
+    const isBlocked = await redis.get(`blocked:${clientId}`);
+    if (isBlocked) {
+      return NextResponse.json(
+        { error: 'Your access to this service has been temporarily suspended due to suspicious activity.' },
+        { status: 403 }
       );
     }
 
@@ -88,15 +97,6 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check if client is blocked
-    const isBlocked = await redis.get(`blocked:${clientId}`);
-    if (isBlocked) {
-      return NextResponse.json(
-        { error: 'Your access to this service has been temporarily suspended due to suspicious activity.' },
-        { status: 403 }
-      );
-    }
-
     const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
@@ -106,7 +106,7 @@ export async function POST(request: Request) {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
-    // Determine the language for formatting
+    // Determine the language and tone for formatting
     const language = options?.language || 'english';
     const tone = options?.tone || 'general';
 
@@ -156,31 +156,28 @@ export async function POST(request: Request) {
     `;
 
     // Add language-specific instructions
-    let enhancedPrompt = userPrompt;
-    if (options) {
-      if (options.language === 'urdu') {
-        systemInstruction += `
-        For Urdu greetings:
-        - Use proper Urdu script, not Roman Urdu or transliteration
-        - Incorporate culturally appropriate phrases and expressions
-        - Ensure the formatting and grammar are correct for Urdu
-        - Make sure the text is properly right-aligned in your response
-        - Add appropriate decorative elements that suit Urdu text aesthetics
-        `;
-      }
+    if (options?.language === 'urdu') {
+      systemInstruction += `
+      For Urdu greetings:
+      - Use proper Urdu script, not Roman Urdu or transliteration
+      - Incorporate culturally appropriate phrases and expressions
+      - Ensure the formatting and grammar are correct for Urdu
+      - Make sure the text is properly right-aligned in your response
+      - Add appropriate decorative elements that suit Urdu text aesthetics
+      `;
+    }
 
-      // Add tone-specific instructions
-      if (options.tone) {
-        const toneInstructions: Record<string, string> = {
-          family: "The tone should be warm, loving, and familiar, expressing deep connection and care.",
-          friends: "The tone should be cheerful, casual, and full of camaraderie.",
-          spouse: "The tone should be romantic, intimate, and deeply affectionate.",
-          formal: "The tone should be respectful, dignified, and professionally appropriate.",
-          college: "The tone should be energetic, modern, and relatable to young adults."
-        };
-        if (toneInstructions[options.tone]) {
-          systemInstruction += `\nTone instruction: ${toneInstructions[options.tone]}`;
-        }
+    // Add tone-specific instructions
+    if (options?.tone) {
+      const toneInstructions: Record<string, string> = {
+        family: "The tone should be warm, loving, and familiar, expressing deep connection and care.",
+        friends: "The tone should be cheerful, casual, and full of camaraderie.",
+        spouse: "The tone should be romantic, intimate, and deeply affectionate.",
+        formal: "The tone should be respectful, dignified, and professionally appropriate.",
+        college: "The tone should be energetic, modern, and relatable to young adults."
+      };
+      if (toneInstructions[options.tone]) {
+        systemInstruction += `\nTone instruction: ${toneInstructions[options.tone]}`;
       }
     }
 
@@ -207,7 +204,7 @@ export async function POST(request: Request) {
       ],
     });
 
-    const result = await chat.sendMessage(enhancedPrompt);
+    const result = await chat.sendMessage(userPrompt);
 
     if (!result.response) {
       return NextResponse.json({ error: 'Failed to generate response or content blocked.' }, { status: 500 });
@@ -215,42 +212,47 @@ export async function POST(request: Request) {
 
     let responseText = result.response.text();
 
-    if(responseText.includes("This service is exclusively for generating Eid greetings.")) {
+    // Check if response indicates non-Eid content was requested
+    if (responseText.includes("This service is exclusively for generating Eid greetings.")) {
+      // Block users who ask for non-Eid content
+      await redis.set(`blocked:${clientId}`, 1, { ex: 24 * 60 * 60 });
       await redis.lpush('security-logs', JSON.stringify({
         timestamp: new Date().toISOString(),
         clientId: clientId.substring(0, 10) + '...',
         prompt: userPrompt.substring(0, 50) + '...',
-        action: 'blocked'
-        }));
-    }
-
-    await redis.set(`blocked:${clientId}`, 1, { ex: 24 * 60 * 60 });
-    
-    // Don't append the closing phrase if it's already included in the response
-    if (!responseText.includes("This service is exclusively for generating Eid greetings.")) {
+        action: 'blocked-non-eid'
+      }));
+      
+      return NextResponse.json({ 
+        greeting: responseText,
+        formattedGreeting: true,
+        warning: "Your account has been temporarily blocked for requesting non-Eid content."
+      });
+    } else {
+      // Don't append the closing phrase if it's already included in the response
       if (!responseText.includes("تَقَبَّلَ اللَّهُ مِنَّا وَمِنْكُمْ") && !responseText.toLowerCase().includes("may allah accept from us and from you")) {
         responseText += "\n\n✧┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈✧\nتَقَبَّلَ اللَّهُ مِنَّا وَمِنْكُمْ\nMay Allah accept from us and from you.\n✧┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈✧";
       }
-    }
 
-    // Update rate limit
-    if (requestCount === null) {
-      await redis.set(rateLimitKey, 1, { ex: RATE_LIMIT.WINDOW_SIZE_IN_SECONDS });
-    } else {
-      await redis.incr(rateLimitKey);
-    }
+      // Update rate limit
+      if (requestCount === null) {
+        await redis.set(rateLimitKey, 1, { ex: RATE_LIMIT.WINDOW_SIZE_IN_SECONDS });
+      } else {
+        await redis.incr(rateLimitKey);
+      }
 
-    // Log usage for analytics
-    await redis.lpush('greeting-logs', JSON.stringify({
-      timestamp: new Date().toISOString(),
-      clientId: clientId.substring(0, 10) + '...',
-      language: options?.language || 'english',
-      tone: options?.tone || 'general',
-      includeHadith: options?.includeHadith || false,
-      includeQuran: options?.includeQuran || false,
-      promptLength: userPrompt.length,
-      responseLength: responseText.length,
-    }));
+      // Log usage for analytics
+      await redis.lpush('greeting-logs', JSON.stringify({
+        timestamp: new Date().toISOString(),
+        clientId: clientId.substring(0, 10) + '...',
+        language: options?.language || 'english',
+        tone: options?.tone || 'general',
+        includeHadith: options?.includeHadith || false,
+        includeQuran: options?.includeQuran || false,
+        promptLength: userPrompt.length,
+        responseLength: responseText.length,
+      }));
+    }
 
     return NextResponse.json({ 
       greeting: responseText,
